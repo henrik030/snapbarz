@@ -428,7 +428,7 @@ export default function VideoEditor() {
             Font size — {settings.fontSize}px
           </label>
           <input
-            type="range" min={14} max={72} value={settings.fontSize}
+            type="range" min={14} max={120} value={settings.fontSize}
             onChange={(e) => setSettings((s) => ({ ...s, fontSize: Number(e.target.value) }))}
             className="w-full accent-white cursor-pointer"
           />
@@ -464,7 +464,7 @@ export default function VideoEditor() {
             Bar padding — {settings.barPadding}px
           </label>
           <input
-            type="range" min={4} max={48} value={settings.barPadding}
+            type="range" min={4} max={60} value={settings.barPadding}
             onChange={(e) => setSettings((s) => ({ ...s, barPadding: Number(e.target.value) }))}
             className="w-full accent-white cursor-pointer"
           />
