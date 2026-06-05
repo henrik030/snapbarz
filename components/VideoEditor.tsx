@@ -483,7 +483,13 @@ export default function VideoEditor() {
       </div>
 
       {/* Right panel — preview */}
-      <div className="flex-1 flex items-center justify-center bg-zinc-950 p-6">
+      <div className="flex-1 flex items-center justify-center bg-zinc-950 p-6 relative">
+        <a
+          href="mailto:dymkehenrik@gmail.com?subject=Snapbarz feedback"
+          className="absolute top-4 right-4 text-xs text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
+        >
+          Give feedback
+        </a>
         {!videoSrc ? (
           <div className="text-zinc-600 text-sm text-center">
             <p className="text-4xl mb-3">🎬</p>
