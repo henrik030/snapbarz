@@ -1,36 +1,50 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Snapchat Video Text
 
-## Getting Started
+A browser-based tool to add Snapchat-style caption bars to vertical videos. Upload a video, style your text, preview in real time, and export — all locally in the browser with no upload to any server.
 
-First, run the development server:
+## Features
+
+- **Live preview** — canvas-based overlay updates instantly as you type or adjust settings
+- **Text styling** — bold, italic, font size, bar position, opacity, and padding
+- **Inter variable font** — loaded locally for accurate canvas rendering and FFmpeg export
+- **Fast export** — powered by FFmpeg.wasm (multi-threaded) with H.264 encoding
+- **Export modal** — circular progress indicator, download button, and cancel support
+
+## Getting started
+
+### Requirements
+
+- Node.js 18+
+- The Inter variable font files placed in `public/font/`:
+  - `Inter-VariableFont_opsz,wght.ttf`
+  - `Inter-Italic-VariableFont_opsz,wght.ttf`
+
+### Install and run
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Build for production
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm run build
+npm start
+```
 
-## Learn More
+## How it works
 
-To learn more about Next.js, take a look at the following resources:
+1. **Preview** — a hidden `<video>` element feeds frames into a `<canvas>` via a `requestAnimationFrame` loop. The canvas draws the dark bar and text on top of each frame using the Canvas 2D API.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+2. **Export** — FFmpeg.wasm processes the original video file entirely in the browser. The bar position and height computed by the canvas are passed as pixel values to FFmpeg's `drawbox` and `drawtext` filters. The Inter font is written into FFmpeg's virtual filesystem before processing.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+3. **No server** — everything runs client-side. Videos never leave the browser.
 
-## Deploy on Vercel
+## Notes
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- The `Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy` headers required by FFmpeg.wasm (for `SharedArrayBuffer`) are set in `next.config.ts`.
+- FFmpeg.wasm loads ~30MB on the first export. Subsequent exports in the same session reuse the loaded instance.
+- Export quality uses H.264 at CRF 23 with the `fast` preset — a good balance of speed and file size.
