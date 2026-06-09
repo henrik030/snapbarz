@@ -2,8 +2,7 @@
 
 import { useRef, useState, useEffect, useCallback } from "react";
 import Image from "next/image";
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
+import type { FFmpeg } from "@ffmpeg/ffmpeg";
 
 interface TextSettings {
   text: string;
@@ -149,6 +148,10 @@ export default function VideoEditor() {
     if (ffmpegLoaded) return;
     setFfmpegLoading(true);
     try {
+      const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
+        import("@ffmpeg/ffmpeg"),
+        import("@ffmpeg/util"),
+      ]);
       const ffmpeg = new FFmpeg();
       const useMT = typeof SharedArrayBuffer !== "undefined";
       const pkg = useMT ? "@ffmpeg/core-mt" : "@ffmpeg/core";
@@ -303,6 +306,8 @@ export default function VideoEditor() {
       const onLog = ({ message }: { message: string }) => console.log("[ffmpeg]", message);
       ffmpeg.on("progress", onProgress);
       ffmpeg.on("log", onLog);
+
+      const { fetchFile } = await import("@ffmpeg/util");
 
       // Write font files into FFmpeg virtual filesystem
       const fontFile = settings.italic ? "font-italic.ttf" : "font.ttf";
