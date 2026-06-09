@@ -2,7 +2,48 @@
 
 import { useRef, useState, useEffect, useCallback } from "react";
 import Image from "next/image";
-import type { FFmpeg } from "@ffmpeg/ffmpeg";
+
+// Minimal typing for the FFmpeg instance (loaded via CDN script tag)
+interface FFmpegInstance {
+  load(opts: {
+    coreURL: string;
+    wasmURL: string;
+    workerURL?: string;
+  }): Promise<void>;
+  writeFile(name: string, data: Uint8Array): Promise<void>;
+  readFile(name: string): Promise<Uint8Array | string>;
+  exec(args: string[]): Promise<number>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  on(event: string, handler: (data: any) => void): void;
+  terminate(): void;
+}
+
+// Inline utilities (replaces @ffmpeg/util)
+async function fetchFile(source: string | File | Blob): Promise<Uint8Array> {
+  if (source instanceof File || source instanceof Blob) {
+    return new Uint8Array(await source.arrayBuffer());
+  }
+  const resp = await fetch(source);
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+async function toBlobURL(url: string, mimeType: string): Promise<string> {
+  const resp = await fetch(url);
+  const blob = new Blob([await resp.arrayBuffer()], { type: mimeType });
+  return URL.createObjectURL(blob);
+}
+
+// Load FFmpeg via script tag to bypass Turbopack's module system
+function loadFFmpegScript(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if ((window as unknown as Record<string, unknown>).FFmpegWASM) { resolve(); return; }
+    const script = document.createElement("script");
+    script.src = "/ffmpeg/ffmpeg.js";
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load FFmpeg script"));
+    document.head.appendChild(script);
+  });
+}
 
 interface TextSettings {
   text: string;
@@ -109,7 +150,7 @@ export default function VideoEditor() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [settings, setSettings] = useState<TextSettings>(DEFAULT_SETTINGS);
   const [isExporting, setIsExporting] = useState(false);
-  const [ffmpegLoading, setFfmpegLoading] = useState(false);
+  const [loadingPhase, setLoadingPhase] = useState("");
   const [exportProgress, setExportProgress] = useState(0);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportDone, setExportDone] = useState(false);
@@ -123,7 +164,7 @@ export default function VideoEditor() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animFrameRef = useRef<number>(0);
-  const ffmpegRef = useRef<FFmpeg | null>(null);
+  const ffmpegRef = useRef<FFmpegInstance | null>(null);
   const settingsRef = useRef(settings);
   const overlayGeometryRef = useRef({ barY: 0, barHeight: 0, canvasW: 0, canvasH: 0 });
 
@@ -146,29 +187,37 @@ export default function VideoEditor() {
 
   const loadFfmpeg = useCallback(async () => {
     if (ffmpegLoaded) return;
-    setFfmpegLoading(true);
     try {
-      const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
-        import("@ffmpeg/ffmpeg"),
-        import("@ffmpeg/util"),
-      ]);
-      const ffmpeg = new FFmpeg();
-      const useMT = typeof SharedArrayBuffer !== "undefined";
-      const pkg = useMT ? "@ffmpeg/core-mt" : "@ffmpeg/core";
-      const baseURL = `https://unpkg.com/${pkg}@0.12.6/dist/umd`;
-      console.log(`[ffmpeg] loading ${useMT ? "multi-threaded" : "single-threaded"} build`);
-      const loadOpts: Parameters<FFmpeg["load"]>[0] = {
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-      };
-      if (useMT) {
-        loadOpts.workerURL = await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript");
-      }
-      await ffmpeg.load(loadOpts);
+      setLoadingPhase("Loading FFmpeg…");
+      console.log("[ffmpeg] step 1: loading script tag");
+      await loadFFmpegScript();
+      console.log("[ffmpeg] step 2: script ready, constructing instance");
+
+      const win = window as unknown as Record<string, unknown>;
+      const FFmpegWASM = win.FFmpegWASM as { FFmpeg: new () => FFmpegInstance };
+      const ffmpeg = new FFmpegWASM.FFmpeg();
+
+      // Always use single-threaded core — core-mt has known silent crashes/OOM
+      // with iPhone 4K MOV/HEVC files (pthread errors, Dolby Vision hangs)
+      const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+      console.log("[ffmpeg] step 3: fetching core JS (single-threaded)…");
+
+      setLoadingPhase("Downloading core JS…");
+      const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript");
+      console.log("[ffmpeg] step 4: core JS ready, fetching WASM (~32 MB)…");
+
+      setLoadingPhase("Downloading WASM (~32 MB)…");
+      const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm");
+      console.log("[ffmpeg] step 5: WASM ready");
+
+      console.log("[ffmpeg] step 6: initializing core…");
+      setLoadingPhase("Initializing FFmpeg…");
+      await ffmpeg.load({ coreURL, wasmURL });
       ffmpegRef.current = ffmpeg;
       setFfmpegLoaded(true);
+      console.log("[ffmpeg] ready ✓");
     } finally {
-      setFfmpegLoading(false);
+      setLoadingPhase("");
     }
   }, [ffmpegLoaded]);
 
@@ -299,7 +348,9 @@ export default function VideoEditor() {
     setExportModalOpen(true);
 
     try {
+      console.log("[export] step 1: loading ffmpeg");
       await loadFfmpeg();
+      console.log("[export] step 2: ffmpeg loaded");
       const ffmpeg = ffmpegRef.current!;
 
       const onProgress = ({ progress }: { progress: number }) => setExportProgress(Math.round(progress * 100));
@@ -307,17 +358,17 @@ export default function VideoEditor() {
       ffmpeg.on("progress", onProgress);
       ffmpeg.on("log", onLog);
 
-      const { fetchFile } = await import("@ffmpeg/util");
-
-      // Write font files into FFmpeg virtual filesystem
+      console.log("[export] step 3: writing font files");
       const fontFile = settings.italic ? "font-italic.ttf" : "font.ttf";
       await ffmpeg.writeFile("font.ttf", await fetchFile("/font/Inter-VariableFont_opsz,wght.ttf"));
       await ffmpeg.writeFile("font-italic.ttf", await fetchFile("/font/Inter-Italic-VariableFont_opsz,wght.ttf"));
 
+      console.log("[export] step 4: writing video file", videoFile.name, videoFile.type, videoFile.size, "bytes");
       const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf("."));
       const inputName = `input${inputExt}`;
-      const outputName = `output${inputExt}`;
+      const outputName = "output.mp4"; // Always MP4 — handles MOV/HEVC from iPhone
       await ffmpeg.writeFile(inputName, await fetchFile(videoFile));
+      console.log("[export] step 5: video file written");
 
       const { barY, barHeight, canvasH } = overlayGeometryRef.current;
       console.log("[export] overlay geometry:", overlayGeometryRef.current);
@@ -340,7 +391,33 @@ export default function VideoEditor() {
 
       console.log("[export] filter:", filter);
 
-      const exitCode = await ffmpeg.exec(["-loglevel", "error", "-i", inputName, "-vf", filter, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", outputName]);
+      // -pix_fmt yuv420p   normalizes HEVC 10-bit / iPhone pixel formats for libx264
+      // -c:a aac           re-encodes audio (copy fails on some iPhone audio tracks)
+      // -movflags faststart puts moov atom at start for safe browser playback
+      const execArgs = [
+        "-loglevel", "warning",
+        "-i", inputName,
+        "-vf", filter,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        outputName,
+      ];
+
+      // Race against a 5-minute timeout so WASM hangs don't freeze the UI forever
+      const exitCode = await Promise.race([
+        ffmpeg.exec(execArgs),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("Export timed out after 5 minutes — try a shorter or smaller clip")),
+            5 * 60 * 1000
+          )
+        ),
+      ]);
       if (exitCode !== 0) throw new Error(`FFmpeg exited with code ${exitCode}`);
 
       const data = await ffmpeg.readFile(outputName);
@@ -349,10 +426,12 @@ export default function VideoEditor() {
 
       const plain = new Uint8Array(rawBytes.length);
       plain.set(rawBytes);
-      const blob = new Blob([plain.buffer], { type: videoFile.type });
+      const blob = new Blob([plain.buffer], { type: "video/mp4" });
       const url = URL.createObjectURL(blob);
       setExportUrl(url);
-      setExportFilename(`captioned_${videoFile.name}`);
+      // Always download as .mp4
+      const baseName = videoFile.name.replace(/\.[^.]+$/, "");
+      setExportFilename(`captioned_${baseName}.mp4`);
       setExportDone(true);
     } catch (err) {
       console.error("Export failed:", err);
@@ -581,7 +660,7 @@ export default function VideoEditor() {
               <>
                 <CircleProgress progress={exportProgress} />
                 <p className="text-sm text-zinc-400">
-                  {ffmpegLoading ? "Loading FFmpeg…" : "Exporting your video…"}
+                  {loadingPhase || "Exporting your video…"}
                 </p>
                 <button
                   onClick={() => {
@@ -589,7 +668,7 @@ export default function VideoEditor() {
                     ffmpegRef.current?.terminate();
                     ffmpegRef.current = null;
                     setFfmpegLoaded(false);
-                    setFfmpegLoading(false);
+                    setLoadingPhase("");
                     setIsExporting(false);
                     setExportProgress(0);
                     setExportModalOpen(false);
