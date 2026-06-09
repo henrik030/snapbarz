@@ -110,6 +110,7 @@ export default function VideoEditor() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [settings, setSettings] = useState<TextSettings>(DEFAULT_SETTINGS);
   const [isExporting, setIsExporting] = useState(false);
+  const [ffmpegLoading, setFfmpegLoading] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportDone, setExportDone] = useState(false);
@@ -146,15 +147,26 @@ export default function VideoEditor() {
 
   const loadFfmpeg = useCallback(async () => {
     if (ffmpegLoaded) return;
-    const ffmpeg = new FFmpeg();
-    const baseURL = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/umd";
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-      workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript"),
-    });
-    ffmpegRef.current = ffmpeg;
-    setFfmpegLoaded(true);
+    setFfmpegLoading(true);
+    try {
+      const ffmpeg = new FFmpeg();
+      const useMT = typeof SharedArrayBuffer !== "undefined";
+      const pkg = useMT ? "@ffmpeg/core-mt" : "@ffmpeg/core";
+      const baseURL = `https://unpkg.com/${pkg}@0.12.6/dist/umd`;
+      console.log(`[ffmpeg] loading ${useMT ? "multi-threaded" : "single-threaded"} build`);
+      const loadOpts: Parameters<FFmpeg["load"]>[0] = {
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+      };
+      if (useMT) {
+        loadOpts.workerURL = await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript");
+      }
+      await ffmpeg.load(loadOpts);
+      ffmpegRef.current = ffmpeg;
+      setFfmpegLoaded(true);
+    } finally {
+      setFfmpegLoading(false);
+    }
   }, [ffmpegLoaded]);
 
   const drawOverlay = useCallback(() => {
@@ -287,8 +299,10 @@ export default function VideoEditor() {
       await loadFfmpeg();
       const ffmpeg = ffmpegRef.current!;
 
-      ffmpeg.on("progress", ({ progress }) => setExportProgress(Math.round(progress * 100)));
-      ffmpeg.on("log", ({ message }) => console.log("[ffmpeg]", message));
+      const onProgress = ({ progress }: { progress: number }) => setExportProgress(Math.round(progress * 100));
+      const onLog = ({ message }: { message: string }) => console.log("[ffmpeg]", message);
+      ffmpeg.on("progress", onProgress);
+      ffmpeg.on("log", onLog);
 
       // Write font files into FFmpeg virtual filesystem
       const fontFile = settings.italic ? "font-italic.ttf" : "font.ttf";
@@ -561,13 +575,16 @@ export default function VideoEditor() {
             {!exportDone ? (
               <>
                 <CircleProgress progress={exportProgress} />
-                <p className="text-sm text-zinc-400">Exporting your video…</p>
+                <p className="text-sm text-zinc-400">
+                  {ffmpegLoading ? "Loading FFmpeg…" : "Exporting your video…"}
+                </p>
                 <button
                   onClick={() => {
                     if (!confirm("Cancel the export?")) return;
                     ffmpegRef.current?.terminate();
                     ffmpegRef.current = null;
                     setFfmpegLoaded(false);
+                    setFfmpegLoading(false);
                     setIsExporting(false);
                     setExportProgress(0);
                     setExportModalOpen(false);
