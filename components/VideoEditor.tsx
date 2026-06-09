@@ -2,47 +2,21 @@
 
 import { useRef, useState, useEffect, useCallback } from "react";
 import Image from "next/image";
+import * as MP4Box from "mp4box";
+import { Muxer, ArrayBufferTarget } from "mp4-muxer";
 
-// Minimal typing for the FFmpeg instance (loaded via CDN script tag)
-interface FFmpegInstance {
-  load(opts: {
-    coreURL: string;
-    wasmURL: string;
-    workerURL?: string;
-  }): Promise<void>;
-  writeFile(name: string, data: Uint8Array): Promise<void>;
-  readFile(name: string): Promise<Uint8Array | string>;
-  exec(args: string[]): Promise<number>;
+// Suppress mp4box's console.error for padding bytes at end of file.
+// "Invalid box type: ''" is a benign warning about null-byte padding, not a real error.
+{
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  on(event: string, handler: (data: any) => void): void;
-  terminate(): void;
-}
-
-// Inline utilities (replaces @ffmpeg/util)
-async function fetchFile(source: string | File | Blob): Promise<Uint8Array> {
-  if (source instanceof File || source instanceof Blob) {
-    return new Uint8Array(await source.arrayBuffer());
+  const log = (MP4Box as any).Log;
+  if (log?.error) {
+    const orig = log.error.bind(log);
+    log.error = (module: string, msg: string, ...rest: unknown[]) => {
+      if (module === "BoxParser" && typeof msg === "string" && msg.startsWith("Invalid box type:")) return;
+      orig(module, msg, ...rest);
+    };
   }
-  const resp = await fetch(source);
-  return new Uint8Array(await resp.arrayBuffer());
-}
-
-async function toBlobURL(url: string, mimeType: string): Promise<string> {
-  const resp = await fetch(url);
-  const blob = new Blob([await resp.arrayBuffer()], { type: mimeType });
-  return URL.createObjectURL(blob);
-}
-
-// Load FFmpeg via script tag to bypass Turbopack's module system
-function loadFFmpegScript(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if ((window as unknown as Record<string, unknown>).FFmpegWASM) { resolve(); return; }
-    const script = document.createElement("script");
-    script.src = "/ffmpeg/ffmpeg.js";
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Failed to load FFmpeg script"));
-    document.head.appendChild(script);
-  });
 }
 
 interface TextSettings {
@@ -145,6 +119,216 @@ function fmt(s: number) {
   return `${m}:${sec}`;
 }
 
+function drawOverlayOnFrame(
+  frame: VideoFrame,
+  canvas: OffscreenCanvas,
+  ctx: OffscreenCanvasRenderingContext2D,
+  settings: TextSettings,
+  rotation: 0 | 90 | 180 | 270 = 0,
+) {
+  const { text, fontSize, positionY, barOpacity, barPadding, bold, italic } = settings;
+
+  // Apply rotation transform before drawing the raw frame.
+  // canvas is already sized to the display dimensions (post-rotation).
+  ctx.save();
+  if (rotation === 90) {
+    ctx.translate(canvas.width, 0);
+    ctx.rotate(Math.PI / 2);
+  } else if (rotation === 180) {
+    ctx.translate(canvas.width, canvas.height);
+    ctx.rotate(Math.PI);
+  } else if (rotation === 270) {
+    ctx.translate(0, canvas.height);
+    ctx.rotate(-Math.PI / 2);
+  }
+  ctx.drawImage(frame, 0, 0, frame.codedWidth, frame.codedHeight);
+  ctx.restore();
+
+  if (!text.trim()) return;
+
+  const weight = bold ? "bold" : "normal";
+  const style = italic ? "italic" : "normal";
+  ctx.font = `${style} ${weight} ${fontSize}px Inter, -apple-system, sans-serif`;
+
+  const maxWidth = canvas.width - barPadding * 2;
+  const lines: string[] = [];
+
+  for (const paragraph of text.split("\n")) {
+    const words = paragraph.split(" ");
+    let current = "";
+    for (const word of words) {
+      const test = current ? `${current} ${word}` : word;
+      if (ctx.measureText(test).width > maxWidth && current) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = test;
+      }
+    }
+    lines.push(current);
+  }
+
+  const lineHeight = fontSize * 1.3;
+  const actualTextHeight = (lines.length - 1) * lineHeight + fontSize;
+  const barHeight = actualTextHeight + barPadding * 2;
+  const barY = Math.max(
+    0,
+    Math.min(canvas.height - barHeight, (positionY / 100) * canvas.height - barHeight / 2)
+  );
+
+  ctx.fillStyle = `rgba(0, 0, 0, ${barOpacity})`;
+  ctx.fillRect(0, barY, canvas.width, barHeight);
+
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+
+  lines.forEach((line, i) => {
+    ctx.fillText(line, canvas.width / 2, barY + barPadding + i * lineHeight, maxWidth);
+  });
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type MP4BoxFile = any;
+
+// Derive rotation angle (0 | 90 | 180 | 270) from a tkhd matrix (9 int32 values, 16.16 fixed-point).
+function getRotationDeg(matrix: number[]): 0 | 90 | 180 | 270 {
+  const a = matrix[0] / 65536;
+  const b = matrix[1] / 65536;
+  const deg = Math.round(Math.atan2(b, a) * 180 / Math.PI);
+  const norm = ((deg % 360) + 360) % 360;
+  if (norm === 90 || norm === 180 || norm === 270) return norm;
+  return 0;
+}
+
+interface DemuxResult {
+  videoChunks: EncodedVideoChunk[];
+  videoConfig: VideoDecoderConfig;
+  audioChunks: EncodedAudioChunk[];
+  audioConfig: AudioDecoderConfig | null;
+  durationUs: number;
+  width: number;
+  height: number;
+  rotation: 0 | 90 | 180 | 270;
+}
+
+function demuxFile(file: File): Promise<DemuxResult> {
+  return new Promise((resolve, reject) => {
+    const mp4 = MP4Box.createFile() as MP4BoxFile;
+
+    const videoChunks: EncodedVideoChunk[] = [];
+    const audioChunks: EncodedAudioChunk[] = [];
+    let videoConfig: VideoDecoderConfig | null = null;
+    let audioConfig: AudioDecoderConfig | null = null;
+    let videoTrackId = -1;
+    let audioTrackId = -1;
+    let durationUs = 0;
+    let width = 0;
+    let height = 0;
+    let rotation: 0 | 90 | 180 | 270 = 0;
+
+    mp4.onError = reject;
+
+    mp4.onReady = (info: MP4BoxFile) => {
+      durationUs = Math.round(info.duration / info.timescale * 1_000_000);
+
+      const videoTrack = info.videoTracks?.[0];
+      const audioTrack = info.audioTracks?.[0];
+
+      if (!videoTrack) { reject(new Error("No video track found")); return; }
+
+      videoTrackId = videoTrack.id;
+      width = videoTrack.video.width;
+      height = videoTrack.video.height;
+      const tkhd = mp4.getTrackById(videoTrack.id)?.tkhd;
+      if (tkhd?.matrix) rotation = getRotationDeg(tkhd.matrix);
+
+      const codec = videoTrack.codec.startsWith("avc") ? videoTrack.codec
+        : videoTrack.codec.startsWith("hev") ? videoTrack.codec
+        : videoTrack.codec;
+
+      videoConfig = {
+        codec,
+        codedWidth: width,
+        codedHeight: height,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        description: getVideoDescription(mp4, videoTrack as any),
+      };
+
+      mp4.setExtractionOptions(videoTrackId, null, { nbSamples: 100 });
+
+      if (audioTrack) {
+        audioTrackId = audioTrack.id;
+        audioConfig = {
+          codec: audioTrack.codec,
+          sampleRate: audioTrack.audio.sample_rate,
+          numberOfChannels: audioTrack.audio.channel_count,
+        };
+        mp4.setExtractionOptions(audioTrackId, null, { nbSamples: 100 });
+      }
+
+      mp4.start();
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mp4.onSamples = (_trackId: number, _user: unknown, samples: any[]) => {
+      for (const sample of samples) {
+        const isVideo = sample.track_id === videoTrackId;
+        const isAudio = sample.track_id === audioTrackId;
+        const ts = Math.round(sample.cts * 1_000_000 / sample.timescale);
+        const dur = Math.round(sample.duration * 1_000_000 / sample.timescale);
+
+        if (isVideo) {
+          videoChunks.push(new EncodedVideoChunk({
+            type: sample.is_sync ? "key" : "delta",
+            timestamp: ts,
+            duration: dur,
+            data: sample.data,
+          }));
+        } else if (isAudio) {
+          audioChunks.push(new EncodedAudioChunk({
+            type: "key",
+            timestamp: ts,
+            duration: dur,
+            data: sample.data,
+          }));
+        }
+      }
+    };
+
+    file.arrayBuffer().then((buf) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (buf as any).fileStart = 0;
+      mp4.appendBuffer(buf);
+      mp4.flush();
+
+      // Give onSamples a tick to fire after flush
+      setTimeout(() => {
+        if (!videoConfig) { reject(new Error("Could not read video config")); return; }
+        resolve({ videoChunks, videoConfig, audioChunks, audioConfig, durationUs, width, height, rotation });
+      }, 100);
+    }).catch(reject);
+  });
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getVideoDescription(mp4: MP4BoxFile, track: any): Uint8Array | undefined {
+  const trak = mp4.getTrackById(track.id);
+  if (!trak) return undefined;
+  for (const entry of trak.mdia?.minf?.stbl?.stsd?.entries ?? []) {
+    const box = entry.avcC ?? entry.hvcC ?? entry.av1C;
+    if (box) {
+      // BIG_ENDIAN = 1 in mp4box v2 (LITTLE_ENDIAN = 2)
+      const stream = new MP4Box.DataStream(undefined, 0, 1 /* BIG_ENDIAN */);
+      box.write(stream);
+      // box.size is set by write() to the exact byte count (header included).
+      // Slice off the 8-byte box header to get the raw decoder config record.
+      return new Uint8Array(stream.buffer as ArrayBuffer, 8, box.size - 8);
+    }
+  }
+  return undefined;
+}
+
 export default function VideoEditor() {
   const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -156,19 +340,23 @@ export default function VideoEditor() {
   const [exportDone, setExportDone] = useState(false);
   const [exportUrl, setExportUrl] = useState<string | null>(null);
   const [exportFilename, setExportFilename] = useState("");
-  const [ffmpegLoaded, setFfmpegLoaded] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [showBrowserHint, setShowBrowserHint] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animFrameRef = useRef<number>(0);
-  const ffmpegRef = useRef<FFmpegInstance | null>(null);
   const settingsRef = useRef(settings);
-  const overlayGeometryRef = useRef({ barY: 0, barHeight: 0, canvasW: 0, canvasH: 0 });
+  const abortRef = useRef(false);
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  useEffect(() => {
+    const isChromium = !!(window as unknown as Record<string, unknown>).chrome;
+    if (!isChromium) setShowBrowserHint(true);
+  }, []);
 
   // Load Inter variable font for canvas rendering
   useEffect(() => {
@@ -184,42 +372,6 @@ export default function VideoEditor() {
       .then(([r, i]) => { document.fonts.add(r); document.fonts.add(i); })
       .catch(console.error);
   }, []);
-
-  const loadFfmpeg = useCallback(async () => {
-    if (ffmpegLoaded) return;
-    try {
-      setLoadingPhase("Loading FFmpeg…");
-      console.log("[ffmpeg] step 1: loading script tag");
-      await loadFFmpegScript();
-      console.log("[ffmpeg] step 2: script ready, constructing instance");
-
-      const win = window as unknown as Record<string, unknown>;
-      const FFmpegWASM = win.FFmpegWASM as { FFmpeg: new () => FFmpegInstance };
-      const ffmpeg = new FFmpegWASM.FFmpeg();
-
-      // Always use single-threaded core — core-mt has known silent crashes/OOM
-      // with iPhone 4K MOV/HEVC files (pthread errors, Dolby Vision hangs)
-      const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
-      console.log("[ffmpeg] step 3: fetching core JS (single-threaded)…");
-
-      setLoadingPhase("Downloading core JS…");
-      const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript");
-      console.log("[ffmpeg] step 4: core JS ready, fetching WASM (~32 MB)…");
-
-      setLoadingPhase("Downloading WASM (~32 MB)…");
-      const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm");
-      console.log("[ffmpeg] step 5: WASM ready");
-
-      console.log("[ffmpeg] step 6: initializing core…");
-      setLoadingPhase("Initializing FFmpeg…");
-      await ffmpeg.load({ coreURL, wasmURL });
-      ffmpegRef.current = ffmpeg;
-      setFfmpegLoaded(true);
-      console.log("[ffmpeg] ready ✓");
-    } finally {
-      setLoadingPhase("");
-    }
-  }, [ffmpegLoaded]);
 
   const drawOverlay = useCallback(() => {
     const video = videoRef.current;
@@ -270,13 +422,6 @@ export default function VideoEditor() {
       0,
       Math.min(canvas.height - barHeight, (s.positionY / 100) * canvas.height - barHeight / 2)
     );
-
-    overlayGeometryRef.current = {
-      barY,
-      barHeight,
-      canvasW: canvas.width,
-      canvasH: canvas.height,
-    };
 
     ctx.fillStyle = `rgba(0, 0, 0, ${s.barOpacity})`;
     ctx.fillRect(0, barY, canvas.width, barHeight);
@@ -346,100 +491,114 @@ export default function VideoEditor() {
     setExportDone(false);
     setExportUrl(null);
     setExportModalOpen(true);
+    abortRef.current = false;
+
+    // Pause playback — frames are being read for export
+    if (videoRef.current) { videoRef.current.pause(); setIsPlaying(false); }
 
     try {
-      console.log("[export] step 1: loading ffmpeg");
-      await loadFfmpeg();
-      console.log("[export] step 2: ffmpeg loaded");
-      const ffmpeg = ffmpegRef.current!;
+      setLoadingPhase("Reading video…");
+      const { videoChunks, videoConfig, audioChunks, audioConfig, durationUs, width, height, rotation } =
+        await demuxFile(videoFile);
 
-      const onProgress = ({ progress }: { progress: number }) => setExportProgress(Math.round(progress * 100));
-      const onLog = ({ message }: { message: string }) => console.log("[ffmpeg]", message);
-      ffmpeg.on("progress", onProgress);
-      ffmpeg.on("log", onLog);
+      if (abortRef.current) return;
 
-      console.log("[export] step 3: writing font files");
-      const fontFile = settings.italic ? "font-italic.ttf" : "font.ttf";
-      await ffmpeg.writeFile("font.ttf", await fetchFile("/font/Inter-VariableFont_opsz,wght.ttf"));
-      await ffmpeg.writeFile("font-italic.ttf", await fetchFile("/font/Inter-Italic-VariableFont_opsz,wght.ttf"));
+      // Display dimensions flip when rotation is 90° or 270°
+      const displayW = (rotation === 90 || rotation === 270) ? height : width;
+      const displayH = (rotation === 90 || rotation === 270) ? width : height;
+      // H.264 requires even dimensions
+      const encodeW = displayW % 2 === 0 ? displayW : displayW - 1;
+      const encodeH = displayH % 2 === 0 ? displayH : displayH - 1;
 
-      console.log("[export] step 4: writing video file", videoFile.name, videoFile.type, videoFile.size, "bytes");
-      const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf("."));
-      const inputName = `input${inputExt}`;
-      const outputName = "output.mp4"; // Always MP4 — handles MOV/HEVC from iPhone
-      await ffmpeg.writeFile(inputName, await fetchFile(videoFile));
-      console.log("[export] step 5: video file written");
+      setLoadingPhase("Starting encoder…");
+      console.log("[export] video config:", videoConfig, "frames:", videoChunks.length, "rotation:", rotation, "display:", encodeW, "x", encodeH);
 
-      const { barY, barHeight, canvasH } = overlayGeometryRef.current;
-      console.log("[export] overlay geometry:", overlayGeometryRef.current);
-      if (canvasH === 0) throw new Error("Canvas not ready — try again after the video preview loads");
+      const muxer = new Muxer({
+        target: new ArrayBufferTarget(),
+        video: { codec: "avc", width: encodeW, height: encodeH },
+        audio: audioConfig
+          ? { codec: "aac", sampleRate: audioConfig.sampleRate, numberOfChannels: audioConfig.numberOfChannels }
+          : undefined,
+        fastStart: "in-memory",
+      });
 
-      const { barOpacity, fontSize, barPadding, text, bold } = settings;
+      const offscreen = new OffscreenCanvas(encodeW, encodeH);
+      const ctx = offscreen.getContext("2d") as OffscreenCanvasRenderingContext2D;
 
-      // Use real pixel integers — avoids FFmpeg expression parsing issues
-      const barYPx = Math.round(barY);
-      const barHPx = Math.round(barHeight);
-      const textYPx = Math.round(barY + barPadding);
+      const totalFrames = videoChunks.length;
+      let encodedCount = 0;
 
-      const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/:/g, "\\:");
-      const boldFlag = bold ? ":bold=1" : "";
+      const encoder = new VideoEncoder({
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        error: (e) => { throw e; },
+      });
 
-      const filter = [
-        `drawbox=x=0:y=${barYPx}:w=iw:h=${barHPx}:color=black@${barOpacity}:t=fill`,
-        `drawtext=fontfile=${fontFile}:text='${safeText}':fontsize=${fontSize}:fontcolor=white:x=(w-text_w)/2:y=${textYPx}${boldFlag}`,
-      ].join(",");
+      encoder.configure({
+        codec: "avc1.4d0034",
+        width: encodeW,
+        height: encodeH,
+        bitrate: 8_000_000,
+        framerate: 30,
+        hardwareAcceleration: "prefer-hardware",
+      });
 
-      console.log("[export] filter:", filter);
+      const decoder = new VideoDecoder({
+        output: (frame) => {
+          if (abortRef.current) { frame.close(); return; }
 
-      // -pix_fmt yuv420p   normalizes HEVC 10-bit / iPhone pixel formats for libx264
-      // -c:a aac           re-encodes audio (copy fails on some iPhone audio tracks)
-      // -movflags faststart puts moov atom at start for safe browser playback
-      const execArgs = [
-        "-loglevel", "warning",
-        "-i", inputName,
-        "-vf", filter,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        outputName,
-      ];
+          drawOverlayOnFrame(frame, offscreen, ctx, settingsRef.current, rotation);
+          frame.close();
 
-      // Race against a 5-minute timeout so WASM hangs don't freeze the UI forever
-      const exitCode = await Promise.race([
-        ffmpeg.exec(execArgs),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error("Export timed out after 5 minutes — try a shorter or smaller clip")),
-            5 * 60 * 1000
-          )
-        ),
-      ]);
-      if (exitCode !== 0) throw new Error(`FFmpeg exited with code ${exitCode}`);
+          const keyframe = encodedCount % 60 === 0;
+          encoder.encode(new VideoFrame(offscreen, { timestamp: frame.timestamp }), { keyFrame: keyframe });
 
-      const data = await ffmpeg.readFile(outputName);
-      const rawBytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data as string);
-      if (rawBytes.length === 0) throw new Error("FFmpeg produced an empty file");
+          encodedCount++;
+          setExportProgress(Math.round((encodedCount / totalFrames) * 95));
+        },
+        error: (e) => { throw e; },
+      });
 
-      const plain = new Uint8Array(rawBytes.length);
-      plain.set(rawBytes);
-      const blob = new Blob([plain.buffer], { type: "video/mp4" });
+      const support = await VideoDecoder.isConfigSupported(videoConfig);
+      if (!support.supported) throw new Error(`Video codec not supported by this browser: ${videoConfig.codec}`);
+      decoder.configure(videoConfig);
+
+      // Feed chunks to decoder, throttle to avoid unbounded queue
+      for (const chunk of videoChunks) {
+        if (abortRef.current) break;
+        decoder.decode(chunk);
+        // Let encoder breathe if it falls too far behind
+        if (decoder.decodeQueueSize > 20) {
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+
+      await decoder.flush();
+      await encoder.flush();
+
+      // Mux audio chunks directly — no re-encode needed
+      if (audioConfig) {
+        for (const chunk of audioChunks) {
+          muxer.addAudioChunk(chunk, { decoderConfig: audioConfig });
+        }
+      }
+
+      muxer.finalize();
+
+      const { buffer } = muxer.target as ArrayBufferTarget;
+      const blob = new Blob([buffer], { type: "video/mp4" });
       const url = URL.createObjectURL(blob);
+      setExportProgress(100);
       setExportUrl(url);
-      // Always download as .mp4
       const baseName = videoFile.name.replace(/\.[^.]+$/, "");
       setExportFilename(`captioned_${baseName}.mp4`);
       setExportDone(true);
     } catch (err) {
       console.error("Export failed:", err);
       setExportModalOpen(false);
-      alert("Export failed. Check the console for details.");
+      alert(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setIsExporting(false);
-      setExportProgress(0);
+      setLoadingPhase("");
     }
   };
 
@@ -467,7 +626,22 @@ export default function VideoEditor() {
   };
 
   return (
-    <div className="flex flex-col md:flex-row h-screen">
+    <div className="flex flex-col h-screen">
+      {showBrowserHint && (
+        <div className="flex items-center justify-between gap-3 px-4 py-2 bg-amber-950 border-b border-amber-800 text-amber-300 text-xs">
+          <span>This app uses WebCodecs and works best in Chrome or Arc. Export may not work in Safari or Firefox.</span>
+          <button
+            onClick={() => setShowBrowserHint(false)}
+            className="flex-shrink-0 hover:text-amber-100 transition-colors cursor-pointer"
+            aria-label="Dismiss"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
+    <div className="flex flex-col md:flex-row flex-1 min-h-0">
       {/* Left panel */}
       <div className="w-full md:w-80 flex-shrink-0 bg-zinc-900 border-r border-zinc-800 p-6 flex flex-col gap-6 overflow-y-auto">
         <Image src="/logo.png" alt="Logo" width={160} height={56} className="object-contain" />
@@ -610,10 +784,14 @@ export default function VideoEditor() {
               className="max-h-[72vh] max-w-full rounded-xl shadow-2xl"
               style={{ aspectRatio: "9/16" }}
             />
-            <div className="flex items-center gap-3 w-full px-1">
+            {isExporting && (
+              <p className="text-xs text-zinc-500 animate-pulse">Exporting… {exportProgress > 0 ? `${exportProgress}%` : ""}</p>
+            )}
+            <div className={`flex items-center gap-3 w-full px-1 transition-opacity ${isExporting ? "opacity-30 pointer-events-none select-none" : ""}`}>
               <button
                 onClick={togglePlay}
-                className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-full bg-white text-black cursor-pointer hover:bg-zinc-200 transition-colors"
+                disabled={isExporting}
+                className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-full bg-white text-black cursor-pointer hover:bg-zinc-200 transition-colors disabled:cursor-not-allowed"
                 aria-label={isPlaying ? "Pause" : "Play"}
               >
                 {isPlaying ? (
@@ -631,8 +809,8 @@ export default function VideoEditor() {
                 currentTime={currentTime}
                 duration={duration}
                 onSeek={(t) => {
-                  if (videoRef.current) videoRef.current.currentTime = t;
-                  setCurrentTime(t);
+                  if (!isExporting && videoRef.current) videoRef.current.currentTime = t;
+                  if (!isExporting) setCurrentTime(t);
                 }}
               />
               <span className="flex-shrink-0 text-xs text-zinc-500 tabular-nums">{fmt(duration)}</span>
@@ -665,9 +843,7 @@ export default function VideoEditor() {
                 <button
                   onClick={() => {
                     if (!confirm("Cancel the export?")) return;
-                    ffmpegRef.current?.terminate();
-                    ffmpegRef.current = null;
-                    setFfmpegLoaded(false);
+                    abortRef.current = true;
                     setLoadingPhase("");
                     setIsExporting(false);
                     setExportProgress(0);
@@ -704,6 +880,7 @@ export default function VideoEditor() {
           </div>
         </div>
       )}
+    </div>
     </div>
   );
 }
